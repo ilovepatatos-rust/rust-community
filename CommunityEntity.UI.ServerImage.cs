@@ -10,13 +10,53 @@ using MaskableGraphic = UnityEngine.UI.MaskableGraphic;
 
 public partial class CommunityEntity
 {
-    private static Dictionary<uint, List<UnityEngine.UI.MaskableGraphic>> requestingTextureImages = new Dictionary<uint, List<UnityEngine.UI.MaskableGraphic>>();
+    private static Dictionary<uint, ImageRequest> requestingTextureImages = new Dictionary<uint, ImageRequest>();
     private static Dictionary<uint, CachedTexture> _textureCache = new Dictionary<uint, CachedTexture>();
+
+    private class ImageRequest
+    {
+        public List<Entry> Entries = new List<Entry>();
+
+        public struct Entry
+        {
+            public UnityEngine.UI.MaskableGraphic graphic;
+            public Vector4? slice;
+        }
+    }
 
     private class CachedTexture
     {
         public Texture2D Texture;
+        // Default non-sliced sprite
         public Sprite Sprite;
+        // Cache sprites created with slicing settings
+        public Dictionary<Vector4, Sprite> SlicedSprites;
+
+        public Sprite GetOrCreateSprite(Vector4? slice = null)
+        {
+            // Create sliced sprite if Vector4 settings provided
+            if(slice != null)
+            {
+                if (SlicedSprites != null && SlicedSprites.TryGetValue(slice.Value, out var slicedSprite))
+                    return slicedSprite;
+                
+                SlicedSprites ??= new Dictionary<Vector4, Sprite>();
+
+                // 100 pixels per unit is the same as the constructor below uses for non-sliced sprites
+                slicedSprite = Sprite.Create( Texture, new Rect( 0, 0, Texture.width, Texture.height ), new Vector2( 0.5f, 0.5f ), 100, 0, SpriteMeshType.FullRect, slice.Value);
+                SlicedSprites.Add(slice.Value, slicedSprite);
+
+                return slicedSprite;
+            }
+            
+            // Otherwise create a normal sprite
+            if (Sprite == null)
+            {
+                Sprite = Sprite.Create(Texture, new Rect(0, 0, Texture.width, Texture.height), new Vector2(0.5f, 0.5f));
+            }
+
+            return Sprite;
+        }
 
         public void Destroy()
         {
@@ -30,6 +70,15 @@ public partial class CommunityEntity
             {
                 UnityEngine.Object.Destroy( Sprite );
                 Sprite = null;
+            }
+
+            if (SlicedSprites != null)
+            {
+                foreach (var slicedSprite in SlicedSprites)
+                {
+                    UnityEngine.Object.Destroy( slicedSprite.Value );
+                }
+                SlicedSprites = null;
             }
         }
     }
@@ -49,15 +98,18 @@ public partial class CommunityEntity
 
         var texture = StoreCachedTexture( textureID, bytes );
 
-        List<UnityEngine.UI.MaskableGraphic> components;
-        if ( requestingTextureImages.TryGetValue( textureID, out components ) )
-        {
-            requestingTextureImages.Remove( textureID );
+        // Get existing image request
+        var request = RequestImage(textureID, false);
 
-            foreach ( var c in components )
+        if (request != null)
+        {
+            foreach (var c in request.Entries)
             {
-                ApplyCachedTextureToImage( c, texture );
+                ApplyCachedTextureToImage(c, texture);
             }
+            
+            // Remove request
+            requestingTextureImages.Remove(textureID);
         }
     }
 
@@ -87,10 +139,47 @@ public partial class CommunityEntity
         return texture;
     }
 
-    private void ApplyTextureToImage( UnityEngine.UI.MaskableGraphic component, uint textureID )
+    // Request an image or get the existing request
+    private ImageRequest RequestImage(uint textureID, bool createRequest)
+    {
+        if (!requestingTextureImages.TryGetValue(textureID, out var request) && createRequest)
+        {
+            request = new ImageRequest();
+            requestingTextureImages[textureID] = request;
+            RequestFileFromServer(textureID, FileStorage.Type.png, "CL_ReceiveFilePng");
+        }
+        return request;
+    }
+
+    public Sprite GetOrRequestSprite(uint id, Vector4? slice = null)
+    {
+        var cachedImage = GetCachedTexture(id);
+
+        // Cached in memory
+        if (cachedImage != null)
+        {
+            return cachedImage.GetOrCreateSprite(slice);
+        }
+
+        var bytes = FileStorage.client.Get(id, FileStorage.Type.png, net.ID);
+
+        // Cached on disk
+        if (bytes != null)
+        {
+            cachedImage = StoreCachedTexture(id, bytes);
+            return cachedImage.GetOrCreateSprite(slice);
+        }
+
+        // Create request for texture
+        // NOTE: don't worry about callback since ItemIcon should be polling every frame
+        RequestImage(id, true);
+
+        return null;
+    }
+
+    public void ApplyTextureToImage( UnityEngine.UI.MaskableGraphic component, uint textureID, Vector4? slice = null )
     {
         var texture = GetCachedTexture( textureID );
-
         if ( texture == null )
         {
             var bytes = FileStorage.client.Get( textureID, FileStorage.Type.png, net.ID );
@@ -100,36 +189,33 @@ public partial class CommunityEntity
             }
             else
             {
-                List<UnityEngine.UI.MaskableGraphic> components;
-                if ( !requestingTextureImages.TryGetValue( textureID, out components ) )
+                var request = RequestImage(textureID, true);
+                request.Entries.Add( new ImageRequest.Entry()
                 {
-                    components = new List<UnityEngine.UI.MaskableGraphic>();
-                    requestingTextureImages[ textureID ] = components;
-                    RequestFileFromServer( textureID, FileStorage.Type.png, "CL_ReceiveFilePng" );
-                }
-                components.Add( component );
+                    graphic = component, 
+                    slice = slice
+                });
                 return;
             }
         }
 
-        ApplyCachedTextureToImage( component, texture );
+        ApplyCachedTextureToImage( new ImageRequest.Entry()
+        {
+            graphic = component,
+            slice = slice
+        }, texture );
     }
 
-    private void ApplyCachedTextureToImage( UnityEngine.UI.MaskableGraphic component, CachedTexture texture )
+    private void ApplyCachedTextureToImage( ImageRequest.Entry entry, CachedTexture texture )
     {
-        var image = component as UnityEngine.UI.Image;
+        var image = entry.graphic as UnityEngine.UI.Image;
         if ( image )
         {
-            if ( texture.Sprite == null )
-            {
-                texture.Sprite = Sprite.Create( texture.Texture, new Rect( 0, 0, texture.Texture.width, texture.Texture.height ), new Vector2( 0.5f, 0.5f ) );
-            }
-
-            image.sprite = texture.Sprite;
+            image.sprite = texture.GetOrCreateSprite(entry.slice);
             return;
         }
 
-        var rawImage = component as UnityEngine.UI.RawImage;
+        var rawImage = entry.graphic as UnityEngine.UI.RawImage;
         if ( rawImage )
         {
             rawImage.texture = texture.Texture;
@@ -144,6 +230,9 @@ public partial class CommunityEntity
         }
 
         _textureCache.Clear();
+
+        // Clear image requests as well
+        requestingTextureImages.Clear();
     }
 }
 
